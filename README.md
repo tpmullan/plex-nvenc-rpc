@@ -74,7 +74,14 @@ has zero dependency on Plex's build.
 
 ### Registered codecs
 
-- `h264_nvenc` / `hevc_nvenc` — hardware encoders, real NVENC.
+- `h264_nvenc` / `hevc_nvenc` — hardware encoders, real NVENC. Expose a
+  `crf` and `preset` option, translated to NVENC's own quality/preset
+  scales (`rc=vbr`/`cq` for `crf`; `p1`..`p7` for `preset`) — necessary
+  because Plex's own internal codec resolution can open these directly
+  (bypassing the `libx264` hijack below) even when the command line
+  itself says `-codec:0 libx264`, so a real `priv_class` is what lets
+  the requested quality/speed settings land anywhere at all instead of
+  being silently dropped before encoding starts.
 - `h264` / `hevc` (decode) — hardware decoders, real NVDEC (`cuvid`).
   Registered under the plain codec name because Plex Transcoder always
   requests decode by the generic codec name; whichever plugin is
@@ -94,11 +101,13 @@ has zero dependency on Plex's build.
   explicitly writes `-codec:0 libx264` into the Transcoder command
   line as its own decision, made before Transcoder even starts — so it
   was the only remaining lever. This registration always attempts a
-  real GPU encode first and transparently falls back to a genuine,
-  bundled `libx264` CPU encode (forwarding the same
-  `crf`/`preset`/`x264opts` values Plex actually requested) if the GPU
-  attempt fails for any reason, so it does not force GPU encoding
-  unconditionally.
+  real GPU encode first (forwarding `crf`/`preset`, translated the same
+  way as the plain `h264_nvenc`/`hevc_nvenc` registrations above) and
+  transparently falls back to a genuine, bundled `libx264` CPU encode
+  (forwarding the same `crf`/`preset`/`x264opts` values Plex actually
+  requested, with full option fidelity since it's genuinely libx264) if
+  the GPU attempt fails for any reason, so it does not force GPU
+  encoding unconditionally.
 
 See `docs/history.md` for the full build/debug history, including the
 `av_init_library` interface this plugin implements against.

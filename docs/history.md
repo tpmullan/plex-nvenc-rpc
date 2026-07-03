@@ -159,3 +159,50 @@ what actually gets a real, automatic session onto the GPU. Confirmed
 against multiple real, unmodified Plex sessions: GPU process/memory
 listings during playback showed real hardware decode and encode
 running simultaneously, sustained, with no errors.
+
+## Quality/bitrate silently dropped on the GPU path
+
+Getting the GPU path selected turned out not to be the whole story.
+Live sessions ran on the GPU, at the correct resolution, but at a
+severely bitrate-starved, visually degraded quality — easy to mistake
+for a resolution bug at first, since the symptom (blocky, low-detail
+video) looks similar, but the actual encoded resolution was always
+correct; only the bitrate was collapsing.
+
+Root cause: Plex requests quality via `-crf:0 N` (constant rate
+factor), not an explicit target bitrate. The `libx264` hijack's GPU
+attempt was forwarding a hardcoded "not set" sentinel instead of the
+real requested value, so it never reached the encoder — NVENC then
+fell back to its own bare-minimum default bitrate (independent of
+resolution), regardless of what Plex actually asked for.
+
+Fixing that hijack path alone didn't fully resolve it, because of a
+second, more fundamental issue: live testing showed Plex's own
+internal codec resolution sometimes opens the plain `h264_nvenc`/
+`hevc_nvenc` registrations *directly* — bypassing the `libx264` hijack
+entirely — even while the literal Transcoder command line still reads
+`-codec:0 libx264 -crf:0 N`. Since those two registrations had no
+`priv_class` (no AVOption table at all), any `-crf` value targeting
+them had nowhere to be written by the host's own generic option
+handling and was silently dropped before the plugin's own code ever
+ran — confirmed by adding an unbuffered raw syscall write at the very
+first line of both codecs' init callbacks and observing it never fire
+for a real session, while manually invoking `-codec:0 h264_nvenc
+-crf:0 N` directly reproduced the identical silent-drop behavior.
+Fixed by giving `h264_nvenc`/`hevc_nvenc` a real `priv_class` with
+their own `crf`/`preset` options, translated to NVENC's own scales
+(`rc=vbr`+`cq` for quality, `p1`..`p7` for preset) inside
+`nvenc-helper`, so the request lands correctly regardless of which of
+the two registrations actually ends up handling a given session.
+
+A third, unrelated wrinkle compounded the debugging: this plugin is
+delivered onto Plex's container via three separate Kubernetes
+`subPath` bind mounts of one underlying file (see the main README's
+"Installing" section). `subPath` bind mounts are pinned to the inode
+present at container start — overwriting the underlying file in place
+does not propagate to the mounted copies until the container restarts,
+even though a fresh read of the "real" path shows the new content
+immediately. Every fix during this investigation had to be followed by
+a full pod restart, not just a file update, for it to actually take
+effect in the running session — a build/deploy step easy to miss since
+nothing about it fails loudly.

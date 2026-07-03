@@ -169,6 +169,39 @@ struct nvenc_glue_enc_state {
     struct pending_packet *head, *tail;
 };
 
+/* Plain h264_nvenc/hevc_nvenc need a real priv_class so a -crf option
+ * targeting them has somewhere to land. Without one (priv_data_size ==
+ * 0, no priv_class), the host's generic AVOption-dictionary
+ * application in avcodec_open2() has nothing to apply to and silently
+ * drops any -crf value before our init() ever runs -- discovered when
+ * Plex's own internal codec resolution turned out to open these
+ * directly (bypassing the "libx264" hijack's own crf-carrying
+ * priv_data) even when the command line said "-codec:0 libx264
+ * -crf:0 N"; see docs/history.md. */
+struct nvenc_direct_enc_state {
+    struct nvenc_glue_enc_state base;
+    float crf;
+    char *preset;
+    char *x264opts;
+};
+
+#define NVENC_DIRECT_OFFSET(field) offsetof(struct nvenc_direct_enc_state, field)
+static const AVOption nvenc_direct_options[] = {
+    { "crf", "constant rate factor (mapped to nvenc's cq quality mode)",
+      NVENC_DIRECT_OFFSET(crf), AV_OPT_TYPE_FLOAT, { .dbl = -1 }, -1, 51, AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM },
+    { "preset", "x264-style preset name (translated to an nvenc preset -- see nvenc-helper.c's x264_preset_to_nvenc)",
+      NVENC_DIRECT_OFFSET(preset), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM },
+    { "x264opts", "accepted for symmetry with the libx264 hijack -- no nvenc equivalent, ignored on the GPU path",
+      NVENC_DIRECT_OFFSET(x264opts), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM },
+    { NULL }
+};
+static const AVClass nvenc_direct_class = {
+    .class_name = "nvenc_direct",
+    .item_name = av_default_item_name,
+    .option = nvenc_direct_options,
+    .version = LIBAVUTIL_VERSION_INT,
+};
+
 static void enqueue_packet(struct nvenc_glue_enc_state *st, const struct ipc_packet_hdr *hdr, const uint8_t *data) {
     struct pending_packet *p = av_malloc(sizeof(*p) + hdr->size);
     if (!p) return;
@@ -300,20 +333,25 @@ static int send_ipc_init(AVCodecContext *avctx, int fd, uint32_t codec_id,
 }
 
 static int nvenc_glue_enc_init(AVCodecContext *avctx) {
-    struct nvenc_glue_enc_state *st = av_mallocz(sizeof(*st));
-    if (!st) return AVERROR(ENOMEM);
-    avctx->priv_data = st;
-    st->fd = -1;
-    st->helper_pid = -1;
+    /* priv_data is host-allocated/zeroed now (priv_data_size != 0,
+     * priv_class set) so any -crf/-preset option targeting this codec
+     * directly has already been applied to ds->crf/ds->preset by the
+     * time we get here. x264opts has no nvenc equivalent and is
+     * accepted-but-unused, purely so it doesn't get silently dropped
+     * by the host's option filtering in a way that would be confusing
+     * to debug later. */
+    struct nvenc_direct_enc_state *ds = avctx->priv_data;
+    ds->base.fd = -1;
+    ds->base.helper_pid = -1;
 
-    if (spawn_helper(&st->fd, &st->helper_pid) < 0) {
+    if (spawn_helper(&ds->base.fd, &ds->base.helper_pid) < 0) {
         av_log(avctx, AV_LOG_ERROR, "nvenc-glue: failed to spawn nvenc-helper\n");
         return AVERROR(EIO);
     }
 
     char errbuf[256];
     uint32_t codec_id = avctx->codec_id == AV_CODEC_ID_HEVC ? 1 : 0;
-    int ret = send_ipc_init(avctx, st->fd, codec_id, -1, NULL, NULL, errbuf, sizeof(errbuf));
+    int ret = send_ipc_init(avctx, ds->base.fd, codec_id, ds->crf, ds->preset, NULL, errbuf, sizeof(errbuf));
     if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "nvenc-glue: %s\n", errbuf);
         return ret;
@@ -322,6 +360,9 @@ static int nvenc_glue_enc_init(AVCodecContext *avctx) {
 }
 
 static int nvenc_glue_enc_close(AVCodecContext *avctx) {
+    /* priv_data itself is host-owned now (priv_data_size != 0) --
+     * freed by avcodec_free_context, not by us. Only our own
+     * heap-allocated packet queue needs cleanup here. */
     struct nvenc_glue_enc_state *st = avctx->priv_data;
     if (st) {
         reap_helper(st->fd, st->helper_pid);
@@ -330,7 +371,6 @@ static int nvenc_glue_enc_close(AVCodecContext *avctx) {
             st->head = p->next;
             av_free(p);
         }
-        av_freep(&avctx->priv_data);
     }
     return 0;
 }
@@ -470,7 +510,7 @@ static int libx264_hijack_init(AVCodecContext *avctx) {
     }
 
     char errbuf[256];
-    int ret = send_ipc_init(avctx, hs->base.fd, 0 /* h264_nvenc */, -1, NULL, NULL, errbuf, sizeof(errbuf));
+    int ret = send_ipc_init(avctx, hs->base.fd, 0 /* h264_nvenc */, hs->crf, hs->preset, NULL, errbuf, sizeof(errbuf));
     if (ret == 0) {
         av_log(avctx, AV_LOG_INFO, "nvenc-glue: libx264 hijack: using GPU (h264_nvenc)\n");
         return 0;
@@ -709,12 +749,11 @@ static int nvenc_glue_decode(AVCodecContext *avctx, AVFrame *frame,
 
 /* ===================== Codec table ===================== */
 
-/* No priv_class on any of these: none use AVOptions, and setting
- * priv_class while priv_data_size == 0 trips avcodec.c's debug
- * assertion that avctx->priv_data's first field equals
- * codec->priv_class (the host only allocates/tags priv_data when
- * priv_data_size != 0). We manage our own priv_data via av_mallocz in
- * init() instead. */
+/* Real priv_class + priv_data_size (see nvenc_direct_enc_state above)
+ * so a -crf option targeting these directly (which is what happens
+ * when Plex's own internal codec resolution opens these instead of
+ * going through the "libx264" hijack, even with "-codec:0 libx264" on
+ * the command line -- see docs/history.md) actually lands somewhere. */
 static const FFCodec ff_h264_nvenc_glue_encoder = {
     .p.name         = "h264_nvenc",
     .p.long_name    = "NVIDIA NVENC H.264 encoder (RPC bridge)",
@@ -731,7 +770,8 @@ static const FFCodec ff_h264_nvenc_glue_encoder = {
      * incorrectly. */
     .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HARDWARE,
     .p.pix_fmts     = nvenc_pix_fmts,
-    .priv_data_size = 0,
+    .p.priv_class   = &nvenc_direct_class,
+    .priv_data_size = sizeof(struct nvenc_direct_enc_state),
     .init           = nvenc_glue_enc_init,
     .cb_type        = FF_CODEC_CB_TYPE_ENCODE,
     .cb.encode      = nvenc_glue_encode,
@@ -754,7 +794,8 @@ static const FFCodec ff_hevc_nvenc_glue_encoder = {
      * incorrectly. */
     .p.capabilities = AV_CODEC_CAP_DELAY | AV_CODEC_CAP_HARDWARE,
     .p.pix_fmts     = nvenc_pix_fmts,
-    .priv_data_size = 0,
+    .p.priv_class   = &nvenc_direct_class,
+    .priv_data_size = sizeof(struct nvenc_direct_enc_state),
     .init           = nvenc_glue_enc_init,
     .cb_type        = FF_CODEC_CB_TYPE_ENCODE,
     .cb.encode      = nvenc_glue_encode,

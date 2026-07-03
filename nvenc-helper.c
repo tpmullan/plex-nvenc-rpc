@@ -48,6 +48,32 @@ static void die_send_err(int fd, uint8_t type, const char *fmt, ...) {
     ipc_send_msg(fd, type, buf, (uint32_t)strlen(buf) + 1);
 }
 
+/* x264 preset names (what Plex actually sends) have no naming overlap
+ * with nvenc's own preset scale ("p1".."p7", fastest..slowest/best
+ * quality, in this ffnvcodec/SDK generation) -- map by intent (speed
+ * vs. quality tradeoff position) rather than by name. Returns NULL for
+ * anything unrecognized so the caller leaves nvenc's own default in
+ * place instead of passing through a nonsense value. */
+static const char *x264_preset_to_nvenc(const char *x264_preset) {
+    static const struct { const char *x264; const char *nvenc; } map[] = {
+        { "ultrafast", "p1" },
+        { "superfast", "p1" },
+        { "veryfast",  "p2" },
+        { "faster",    "p3" },
+        { "fast",      "p3" },
+        { "medium",    "p4" },
+        { "slow",      "p5" },
+        { "slower",    "p6" },
+        { "veryslow",  "p7" },
+        { "placebo",   "p7" },
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++) {
+        if (strcmp(x264_preset, map[i].x264) == 0)
+            return map[i].nvenc;
+    }
+    return NULL;
+}
+
 static int handle_init(int fd, const uint8_t *payload, uint32_t payload_len) {
     if (payload_len < sizeof(struct ipc_init_req)) {
         die_send_err(fd, IPC_MSG_INIT_ERR, "INIT payload too short");
@@ -107,6 +133,30 @@ static int handle_init(int fd, const uint8_t *payload, uint32_t payload_len) {
             av_opt_set(g_ctx->priv_data, "preset", preset_buf, 0);
         if (x264opts_buf[0])
             av_opt_set(g_ctx->priv_data, "x264opts", x264opts_buf, 0);
+    }
+
+    /* codec_id 0/1 (GPU nvenc): Plex requests quality via crf, not an
+     * explicit bit_rate -- when crf-based (no -b:v), avctx->bit_rate is
+     * 0, and forwarding that straight to nvenc as its target bitrate
+     * produces a severely bitrate-starved, low-quality encode at the
+     * *correct* resolution (looks like resolution is wrong, but it's
+     * actually a bitrate collapse). nvenc has its own constant-quality
+     * mode (rc=vbr, cq=<0-51, same scale as x264 crf>) -- use that
+     * instead so a crf-based request actually gets quality-based
+     * encoding on the GPU too. rc_max_rate/rc_buffer_size (already set
+     * above) still apply as caps in vbr mode. */
+    if (req.codec_id != 2 && req.crf >= 0) {
+        av_opt_set(g_ctx->priv_data, "rc", "vbr", 0);
+        av_opt_set_double(g_ctx->priv_data, "cq", req.crf, 0);
+    }
+    /* nvenc's own preset scale (p1..p7, fastest..slowest/best) has no
+     * naming overlap with x264's (ultrafast..placebo) -- translate so
+     * Plex's speed/quality tradeoff request still means something on
+     * the GPU path instead of being silently dropped. */
+    if (req.codec_id != 2 && preset_buf[0]) {
+        const char *nvenc_preset = x264_preset_to_nvenc(preset_buf);
+        if (nvenc_preset)
+            av_opt_set(g_ctx->priv_data, "preset", nvenc_preset, 0);
     }
 
     int ret = avcodec_open2(g_ctx, codec, NULL);
