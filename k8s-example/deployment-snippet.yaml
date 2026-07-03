@@ -1,0 +1,28 @@
+# Example volumeMounts additions for a Plex Deployment running on
+# Kubernetes, showing the read-only bind-mount pattern described in
+# the main README's "Installing" section. Adapt the mountPath/subPath
+# build-hash directory (c75335c-... below) to match your own Plex
+# build -- find it via:
+#   kubectl exec -it <plex-pod> -- find / -iname 'liblibx264_encoder.so'
+#
+# Assumes libh264_nvenc_encoder.so and nvenc-helper have already been
+# copied onto the same PersistentVolumeClaim your Plex container mounts
+# at /config, at the path referenced by `subPath` below, and that the
+# three original files (libh264_decoder.so, libhevc_decoder.so,
+# liblibx264_encoder.so) have been backed up elsewhere first.
+
+volumeMounts:
+  # ... your existing volumeMounts, including the base config mount ...
+
+  - name: config
+    mountPath: /config/Library/Application Support/Plex Media Server/Codecs/<your-build-hash>-linux-aarch64/libh264_decoder.so
+    subPath: config/Library/Application Support/Plex Media Server/Codecs/<your-build-hash>-linux-aarch64/libh264_nvenc_encoder.so
+    readOnly: true
+  - name: config
+    mountPath: /config/Library/Application Support/Plex Media Server/Codecs/<your-build-hash>-linux-aarch64/libhevc_decoder.so
+    subPath: config/Library/Application Support/Plex Media Server/Codecs/<your-build-hash>-linux-aarch64/libh264_nvenc_encoder.so
+    readOnly: true
+  - name: config
+    mountPath: /config/Library/Application Support/Plex Media Server/Codecs/<your-build-hash>-linux-aarch64/liblibx264_encoder.so
+    subPath: config/Library/Application Support/Plex Media Server/Codecs/<your-build-hash>-linux-aarch64/libh264_nvenc_encoder.so
+    readOnly: true
