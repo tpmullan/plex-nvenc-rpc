@@ -66,11 +66,11 @@ struct/type *definitions* as headers so the compiler lays out its
 `av_init_library` ABI plus our own IPC protocol. All the real
 encode/decode work — and every NVIDIA/CUDA/musl-vs-glibc concern —
 lives entirely in `nvenc-helper`, a completely ordinary glibc program.
-This also makes future Plex version updates cheap: `glue.c`'s
-`EXPECTED_BUILD_HASH` constant is normally the only thing that needs
-to change (a few-second recompile, since it doesn't link FFmpeg at
-all), and `nvenc-helper` essentially never needs to change since it
-has zero dependency on Plex's build.
+This also makes future Plex version updates cheap: `glue.c` always
+attempts registration regardless of the host's reported FFmpeg
+build/ABI version (see "Version compatibility" below), and
+`nvenc-helper` essentially never needs to change since it has zero
+dependency on Plex's build.
 
 ### Registered codecs
 
@@ -178,9 +178,15 @@ removing the bind mounts restores stock behavior instantly.
   concurrent session limits or wanting to reserve GPU capacity for
   something else.
 - Tested against exactly the Plex build/version noted at the top of
-  this file. `EXPECTED_BUILD_HASH` in `glue.c` will reject a build
-  hash mismatch outright (fails safe) rather than risk an ABI
-  mismatch.
+  this file. On a different host build, `glue.c` no longer refuses to
+  load -- it logs a `WARNING` (expected vs. actual `avcodec_version()`
+  and build hash) and attempts registration anyway, since the
+  alternative (refusing) produces the exact same "no hardware
+  transcode" outcome as a real incompatibility, but without the
+  chance of it actually working. A genuine struct-layout/ABI break
+  between the validated build and the host's build could still crash
+  or corrupt state in the host `Plex Transcoder` process -- watch the
+  Plex log for the mismatch warning and for crashes after an update.
 
 ## Legal
 

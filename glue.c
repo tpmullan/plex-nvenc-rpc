@@ -34,6 +34,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include <stdarg.h>
+#include <time.h>
 #include <unistd.h>
 #include <dlfcn.h>
 #include <signal.h>
@@ -51,8 +53,11 @@
 #include "ipc_protocol.h"
 #include "ipc_io.h"
 
-/* This build's Plex ffmpeg-patch identity, confirmed 2026-07-02.
- * The ONLY thing that needs to change on a Plex FFmpeg-base bump. */
+/* The Plex ffmpeg-patch identity this plugin was built/validated
+ * against, confirmed 2026-07-02. Registration is no longer gated on
+ * matching this exactly (see av_init_library) -- it's logged so a
+ * version mismatch is diagnosable from the Plex log instead of a
+ * silent no-op, but the plugin always attempts to register. */
 #define EXPECTED_BUILD_HASH "c75335c-a7cfb6836f3ed63280a7eb83"
 #define EXPECTED_AVCODEC_VERSION 0x3c1f66u /* packed 60.31.102, avcodec_version() */
 
@@ -89,21 +94,62 @@ static const AVCodecHWConfigInternal *const nvdec_glue_hw_configs[] = {
     NULL,
 };
 
-static char *helper_path(void) {
-    /* Dl_info gives us this .so's own path; the helper binary lives
-     * next to it. Avoids hardcoding the Codecs/<hash>-.../ directory. */
-    static char path[4096];
-    Dl_info info;
-    if (dladdr((void *)helper_path, &info) && info.dli_fname) {
-        char *dir = strdup(info.dli_fname);
-        char *slash = strrchr(dir, '/');
-        if (slash) *slash = '\0';
-        snprintf(path, sizeof(path), "%s/%s", slash ? dir : ".", HELPER_RELATIVE_NAME);
-        free(dir);
-        return path;
+/* Dl_info gives us this .so's own path; both the helper binary and
+ * our own log file live next to it. Avoids hardcoding the
+ * Codecs/<hash>-.../ directory. */
+static const char *plugin_dir(void) {
+    static char dir[4096];
+    static int resolved = 0;
+    if (!resolved) {
+        Dl_info info;
+        if (dladdr((void *)plugin_dir, &info) && info.dli_fname) {
+            snprintf(dir, sizeof(dir), "%s", info.dli_fname);
+            char *slash = strrchr(dir, '/');
+            if (slash) *slash = '\0'; else snprintf(dir, sizeof(dir), ".");
+        } else {
+            snprintf(dir, sizeof(dir), ".");
+        }
+        resolved = 1;
     }
-    snprintf(path, sizeof(path), "./%s", HELPER_RELATIVE_NAME);
+    return dir;
+}
+
+static char *helper_path(void) {
+    static char path[4096];
+    snprintf(path, sizeof(path), "%s/%s", plugin_dir(), HELPER_RELATIVE_NAME);
     return path;
+}
+
+/* Diagnostic log independent of Plex's own stdio/av_log routing --
+ * real Plex sessions run with "-loglevel quiet" on the Transcoder
+ * command line, which gates av_log() at the call site itself (before
+ * any callback runs), so av_log() output is invisible for every
+ * production session regardless of severity. A plain file next to the
+ * plugin guarantees the version-match/GPU-fallback diagnostics this
+ * plugin exists to surface are actually inspectable (`tail
+ * nvenc-glue.log` in the Codecs/<hash>-.../ directory) instead of
+ * silently going nowhere. Opened/closed per call (low frequency --
+ * init-time and fallback events only, never per-frame) so there's no
+ * fd to leak across the plugin's lifetime. */
+static void glue_log(const char *fmt, ...) {
+    char path[4160];
+    snprintf(path, sizeof(path), "%s/nvenc-glue.log", plugin_dir());
+    FILE *f = fopen(path, "a");
+    if (!f) return;
+
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &tmv);
+    fprintf(f, "[%s] ", ts);
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
 }
 
 static int spawn_helper(int *out_fd, pid_t *out_pid) {
@@ -167,6 +213,21 @@ struct nvenc_glue_enc_state {
     int fd;
     pid_t helper_pid;
     struct pending_packet *head, *tail;
+    /* Mid-stream GPU-failure recovery (see try_runtime_cpu_fallback):
+     * cpu_fallback_ok is set at .init time to whether this session's
+     * codec identity has a bitstream-compatible CPU path (true for the
+     * libx264 hijack and for a direct h264_nvenc request -- both real
+     * H264; false for hevc_nvenc, since nvenc-helper has no CPU HEVC
+     * encoder). using_cpu tracks whether a GPU failure already forced
+     * a switch, so later frames stop retrying the GPU. fallback_* mirror
+     * the crf/preset/x264opts Plex originally requested, needed again
+     * if the CPU helper has to be spawned after .init already
+     * returned. */
+    int cpu_fallback_ok;
+    int using_cpu;
+    float fallback_crf;
+    const char *fallback_preset;
+    const char *fallback_x264opts;
 };
 
 /* Plain h264_nvenc/hevc_nvenc need a real priv_class so a -crf option
@@ -343,9 +404,18 @@ static int nvenc_glue_enc_init(AVCodecContext *avctx) {
     struct nvenc_direct_enc_state *ds = avctx->priv_data;
     ds->base.fd = -1;
     ds->base.helper_pid = -1;
+    /* HEVC has no CPU fallback path in nvenc-helper (real libx264 is
+     * H264-only) -- a mid-stream GPU failure on hevc_nvenc has nothing
+     * bitstream-compatible to fall back to, so it stays unrecoverable. */
+    ds->base.cpu_fallback_ok = avctx->codec_id != AV_CODEC_ID_HEVC;
+    ds->base.using_cpu = 0;
+    ds->base.fallback_crf = ds->crf;
+    ds->base.fallback_preset = ds->preset;
+    ds->base.fallback_x264opts = ds->x264opts;
 
     if (spawn_helper(&ds->base.fd, &ds->base.helper_pid) < 0) {
         av_log(avctx, AV_LOG_ERROR, "nvenc-glue: failed to spawn nvenc-helper\n");
+        glue_log("direct encoder init: failed to spawn helper (%s missing/not executable?)", helper_path());
         return AVERROR(EIO);
     }
 
@@ -405,6 +475,77 @@ static uint8_t *pack_frame(const AVFrame *frame, size_t *out_len) {
 /* Legacy FF_CODEC_CB_TYPE_ENCODE callback: the host's own encode.c
  * pulls the frame off its internal queue and hands it to us directly,
  * so we never touch avctx->internal ourselves. */
+/* Sends the current frame (or a FLUSH, if frame == NULL) to whichever
+ * helper st->fd currently points at. Split out of nvenc_glue_encode so
+ * try_runtime_cpu_fallback's caller can resend the exact same frame
+ * against a freshly spawned CPU helper after a GPU failure, instead of
+ * losing it. */
+static int send_frame_or_flush(struct nvenc_glue_enc_state *st, const AVFrame *frame) {
+    if (frame) {
+        size_t buf_len;
+        uint8_t *buf = pack_frame(frame, &buf_len);
+        if (!buf) return AVERROR(ENOMEM);
+        int rc = ipc_send_msg(st->fd, IPC_MSG_FRAME, buf, (uint32_t)buf_len);
+        av_freep(&buf);
+        return rc < 0 ? AVERROR(EIO) : 0;
+    }
+    return ipc_send_msg(st->fd, IPC_MSG_FLUSH, NULL, 0) < 0 ? AVERROR(EIO) : 0;
+}
+
+/* Mid-stream recovery from a GPU encode failure (helper crashed, GPU
+ * wedged, NVENC session limit, driver reset, etc). Without this, any
+ * failure here after .init already succeeded on GPU had no recovery
+ * path at all -- nvenc_glue_encode just returned the error straight to
+ * Plex Transcoder, which treats an encode callback failure as fatal
+ * and tears down the whole session (the stream simply closes for the
+ * client). Mirrors libx264_hijack_init's GPU-then-CPU policy, just
+ * triggered by a runtime failure instead of an init-time one.
+ *
+ * Returns 1 and leaves st->fd pointing at a live CPU helper (INIT_OK
+ * already received) on success, so the caller can resend the frame
+ * that triggered the failure. Returns 0 if no fallback is possible
+ * (already on CPU, this codec identity has no CPU-compatible
+ * bitstream, or the CPU helper itself failed to come up) -- caller
+ * must then propagate the original error, same as before this existed. */
+static int try_runtime_cpu_fallback(AVCodecContext *avctx, struct nvenc_glue_enc_state *st) {
+    if (st->using_cpu)
+        return 0; /* already on CPU -- nothing left to fall back to */
+    if (!st->cpu_fallback_ok) {
+        av_log(avctx, AV_LOG_ERROR,
+               "nvenc-glue: GPU encode failed mid-stream and no CPU-compatible "
+               "fallback exists for this codec (HEVC has no CPU path)\n");
+        glue_log("GPU encode failed mid-stream, no CPU fallback for this codec (HEVC)");
+        return 0;
+    }
+
+    av_log(avctx, AV_LOG_WARNING,
+           "nvenc-glue: GPU encode failed mid-stream, switching to CPU x264 "
+           "for the rest of this session\n");
+    glue_log("GPU encode failed mid-stream, switching to CPU x264 for the rest of this session");
+    reap_helper(st->fd, st->helper_pid);
+    st->fd = -1;
+    st->helper_pid = -1;
+
+    if (spawn_helper(&st->fd, &st->helper_pid) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "nvenc-glue: mid-stream CPU fallback: failed to spawn helper\n");
+        glue_log("mid-stream CPU fallback: failed to spawn helper (%s missing/not executable?)", helper_path());
+        return 0;
+    }
+    char errbuf[256];
+    int ret = send_ipc_init(avctx, st->fd, 2 /* libx264 CPU */,
+                             st->fallback_crf, st->fallback_preset, st->fallback_x264opts,
+                             errbuf, sizeof(errbuf));
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "nvenc-glue: mid-stream CPU fallback also failed: %s\n", errbuf);
+        glue_log("mid-stream CPU fallback also failed: %s", errbuf);
+        return 0;
+    }
+    st->using_cpu = 1;
+    av_log(avctx, AV_LOG_INFO, "nvenc-glue: mid-stream CPU fallback: now using CPU x264\n");
+    glue_log("mid-stream CPU fallback: now using CPU x264");
+    return 1;
+}
+
 static int nvenc_glue_encode(AVCodecContext *avctx, AVPacket *avpkt,
                               const AVFrame *frame, int *got_packet_ptr) {
     struct nvenc_glue_enc_state *st = avctx->priv_data;
@@ -415,20 +556,21 @@ static int nvenc_glue_encode(AVCodecContext *avctx, AVPacket *avpkt,
         return 0;
     }
 
-    if (frame) {
-        size_t buf_len;
-        uint8_t *buf = pack_frame(frame, &buf_len);
-        if (!buf) return AVERROR(ENOMEM);
-        int rc = ipc_send_msg(st->fd, IPC_MSG_FRAME, buf, (uint32_t)buf_len);
-        av_freep(&buf);
-        if (rc < 0) return AVERROR(EIO);
-    } else {
-        if (ipc_send_msg(st->fd, IPC_MSG_FLUSH, NULL, 0) < 0)
-            return AVERROR(EIO);
+    int rc = send_frame_or_flush(st, frame);
+    if (rc < 0) {
+        if (!try_runtime_cpu_fallback(avctx, st)) return rc;
+        rc = send_frame_or_flush(st, frame);
+        if (rc < 0) return rc;
     }
 
     int ret = drain_enc_into_queue(avctx, st);
-    if (ret < 0) return ret;
+    if (ret < 0) {
+        if (!try_runtime_cpu_fallback(avctx, st)) return ret;
+        rc = send_frame_or_flush(st, frame);
+        if (rc < 0) return rc;
+        ret = drain_enc_into_queue(avctx, st);
+        if (ret < 0) return ret;
+    }
 
     if (pop_packet(st, avpkt))
         *got_packet_ptr = 1;
@@ -503,9 +645,18 @@ static int libx264_hijack_init(AVCodecContext *avctx) {
     struct libx264_hijack_state *hs = avctx->priv_data;
     hs->base.fd = -1;
     hs->base.helper_pid = -1;
+    /* Always H264 (h264_nvenc on GPU, real libx264 on CPU) -- a
+     * mid-stream GPU failure later can always fall back, unlike
+     * hevc_nvenc's direct-request path. */
+    hs->base.cpu_fallback_ok = 1;
+    hs->base.using_cpu = 0;
+    hs->base.fallback_crf = hs->crf;
+    hs->base.fallback_preset = hs->preset;
+    hs->base.fallback_x264opts = hs->x264opts;
 
     if (spawn_helper(&hs->base.fd, &hs->base.helper_pid) < 0) {
         av_log(avctx, AV_LOG_ERROR, "nvenc-glue: libx264 hijack: failed to spawn helper (GPU attempt)\n");
+        glue_log("libx264 hijack init: failed to spawn helper (%s missing/not executable?)", helper_path());
         return AVERROR(EIO);
     }
 
@@ -513,25 +664,31 @@ static int libx264_hijack_init(AVCodecContext *avctx) {
     int ret = send_ipc_init(avctx, hs->base.fd, 0 /* h264_nvenc */, hs->crf, hs->preset, NULL, errbuf, sizeof(errbuf));
     if (ret == 0) {
         av_log(avctx, AV_LOG_INFO, "nvenc-glue: libx264 hijack: using GPU (h264_nvenc)\n");
+        glue_log("libx264 hijack init: using GPU (h264_nvenc)");
         return 0;
     }
 
     av_log(avctx, AV_LOG_WARNING, "nvenc-glue: libx264 hijack: GPU unavailable (%s), falling back to CPU x264\n", errbuf);
+    glue_log("libx264 hijack init: GPU unavailable (%s), falling back to CPU x264", errbuf);
     reap_helper(hs->base.fd, hs->base.helper_pid);
     hs->base.fd = -1;
     hs->base.helper_pid = -1;
 
     if (spawn_helper(&hs->base.fd, &hs->base.helper_pid) < 0) {
         av_log(avctx, AV_LOG_ERROR, "nvenc-glue: libx264 hijack: failed to spawn helper (CPU attempt)\n");
+        glue_log("libx264 hijack init: CPU fallback also failed to spawn helper (%s missing/not executable?)", helper_path());
         return AVERROR(EIO);
     }
     ret = send_ipc_init(avctx, hs->base.fd, 2 /* libx264 CPU */, hs->crf, hs->preset, hs->x264opts,
                          errbuf, sizeof(errbuf));
     if (ret < 0) {
         av_log(avctx, AV_LOG_ERROR, "nvenc-glue: libx264 hijack: CPU fallback also failed: %s\n", errbuf);
+        glue_log("libx264 hijack init: CPU fallback also failed: %s", errbuf);
         return ret;
     }
+    hs->base.using_cpu = 1; /* already on CPU -- a later failure has nowhere left to fall back to */
     av_log(avctx, AV_LOG_INFO, "nvenc-glue: libx264 hijack: using CPU (real libx264)\n");
+    glue_log("libx264 hijack init: using CPU (real libx264)");
     return 0;
 }
 
@@ -651,6 +808,7 @@ static int nvenc_glue_dec_init(AVCodecContext *avctx) {
 
     if (spawn_helper(&st->fd, &st->helper_pid) < 0) {
         av_log(avctx, AV_LOG_ERROR, "nvenc-glue: failed to spawn nvenc-helper (decode)\n");
+        glue_log("decoder init: failed to spawn helper (%s missing/not executable?)", helper_path());
         return AVERROR(EIO);
     }
 
@@ -905,6 +1063,48 @@ static const FFCodec ff_hevc_nvdec_alias_decoder = {
     .close          = nvenc_glue_dec_close,
 };
 
+/* Crash visibility: unlike a helper-process crash (already surfaced via
+ * IPC "connection lost" -> try_runtime_cpu_fallback logging), a crash
+ * inside this .so happens in the HOST Plex Transcoder process itself
+ * -- glue.c hand-authors AVCodec/FFCodec struct layouts to match one
+ * specific host build (see EXPECTED_BUILD_HASH), and since the version
+ * gate was removed (2026-07-16) this plugin now always attempts
+ * registration even against a host build it was never validated
+ * against. If the real struct layout differs from what was assumed
+ * despite avcodec_version()'s coarse ABI-epoch number matching, that's
+ * a real, accepted, un-guarded risk of corrupting the host process.
+ * Without this handler such a crash was previously invisible --
+ * Plex Transcoder just vanishes and PMS relaunches it fresh, which
+ * looks identical to nothing having gone wrong at all, not something
+ * that should be read as success by omission. Best-effort only: the
+ * handler itself calls fopen/fprintf (not strictly async-signal-safe),
+ * acceptable for a diagnostic-only crash handler where the alternative
+ * is zero information. */
+static void glue_crash_handler(int sig, siginfo_t *si, void *ucontext) {
+    (void)ucontext;
+    glue_log("CRASH: signal %d (%s) in Plex Transcoder process, faulting address %p",
+             sig, strsignal(sig), si ? si->si_addr : NULL);
+    struct sigaction sa = {0};
+    sa.sa_handler = SIG_DFL;
+    sigaction(sig, &sa, NULL);
+    raise(sig);
+}
+
+static void glue_install_crash_handler(void) {
+    static int installed = 0;
+    if (installed) return;
+    installed = 1;
+    struct sigaction sa = {0};
+    sa.sa_sigaction = glue_crash_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+}
+
 /* --- av_init_library ABI (see docs/history.md): ctx is a small
  * vtable of host callbacks. --- */
 typedef unsigned int (*avcodec_version_fn)(void);
@@ -912,15 +1112,41 @@ typedef const char *(*av_version_info_fn)(void);
 typedef void (*register_fn)(void *codec);
 
 int av_init_library(void **ctx, unsigned int log_level) {
+    glue_install_crash_handler();
     (void)log_level;
     avcodec_version_fn get_version = (avcodec_version_fn)ctx[4];
     av_version_info_fn get_build_hash = (av_version_info_fn)ctx[3];
     register_fn register_codec = (register_fn)ctx[5];
 
-    if (get_version() != EXPECTED_AVCODEC_VERSION)
-        return -1;
-    if (strcmp(get_build_hash(), EXPECTED_BUILD_HASH) != 0)
-        return -1;
+    unsigned int actual_version = get_version();
+    const char *actual_hash = get_build_hash();
+
+    /* No hard gate: always attempt registration so hardware transcode
+     * still gets tried on a host we've never validated against,
+     * instead of a silent no-op fallback to CPU. Both the version this
+     * plugin was built/validated against and what the host actually
+     * reports are always logged (even on an exact match) so a future
+     * mismatch -- and any resulting instability -- is diagnosable from
+     * the Plex log rather than invisible. */
+    if (actual_version != EXPECTED_AVCODEC_VERSION || strcmp(actual_hash, EXPECTED_BUILD_HASH) != 0) {
+        av_log(NULL, AV_LOG_WARNING,
+               "nvenc-glue: host FFmpeg build differs from validated build "
+               "(validated: avcodec_version=0x%x hash=%s; host: avcodec_version=0x%x hash=%s) "
+               "-- attempting registration anyway, watch for crashes/instability\n",
+               EXPECTED_AVCODEC_VERSION, EXPECTED_BUILD_HASH, actual_version, actual_hash);
+        glue_log("host FFmpeg build differs from validated build "
+                 "(validated: avcodec_version=0x%x hash=%s; host: avcodec_version=0x%x hash=%s) "
+                 "-- attempting registration anyway, watch for crashes/instability",
+                 EXPECTED_AVCODEC_VERSION, EXPECTED_BUILD_HASH, actual_version, actual_hash);
+    } else {
+        av_log(NULL, AV_LOG_INFO,
+               "nvenc-glue: host FFmpeg build matches validated build "
+               "(avcodec_version=0x%x hash=%s)\n",
+               actual_version, actual_hash);
+        glue_log("host FFmpeg build matches validated build (avcodec_version=0x%x hash=%s)",
+                 actual_version, actual_hash);
+    }
+    glue_log("av_init_library: registering codecs (plugin dir: %s, helper: %s)", plugin_dir(), helper_path());
 
     register_codec((void *)&ff_h264_nvenc_glue_encoder);
     register_codec((void *)&ff_hevc_nvenc_glue_encoder);
