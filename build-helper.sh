@@ -15,8 +15,17 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$OUT"
 
-sudo apt-get update -qq
-sudo apt-get install -y -qq build-essential git pkg-config yasm nasm ca-certificates
+# CI job containers typically already run as root (no sudo installed,
+# or nothing left to elevate to) -- only shell out to sudo when we're
+# actually unprivileged, so this script works unmodified both for a
+# local interactive run and inside CI.
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+  SUDO="sudo"
+fi
+
+$SUDO apt-get update -qq
+$SUDO apt-get install -y -qq build-essential git pkg-config yasm nasm ca-certificates
 
 cd "$WORK"
 
@@ -25,12 +34,12 @@ git clone --depth 1 https://code.videolan.org/videolan/x264.git x264-src
 cd x264-src
 ./configure --prefix=/usr/local --enable-static --enable-pic --disable-cli --disable-opencl
 make -j"$(nproc)"
-sudo make install
+$SUDO make install
 cd "$WORK"
 
 # --- nv-codec-headers (NVENC/NVDEC API headers, MIT-style license) ---
 git clone --depth 1 --branch n11.1.5.3 https://github.com/FFmpeg/nv-codec-headers.git
-sudo make -C nv-codec-headers install PREFIX=/usr/local
+$SUDO make -C nv-codec-headers install PREFIX=/usr/local
 
 # --- FFmpeg 6.1, NVENC + NVDEC + libx264 enabled ---
 git clone --depth 1 --branch n6.1 https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
