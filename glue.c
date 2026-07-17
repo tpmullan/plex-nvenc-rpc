@@ -363,6 +363,7 @@ static int send_ipc_init(AVCodecContext *avctx, int fd, uint32_t codec_id,
         .crf = crf,
         .preset_len = preset_len,
         .x264opts_len = x264opts_len,
+        .global_header = (avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) ? 1u : 0u,
     };
     memcpy(msgbuf, &req, sizeof(req));
     if (preset_len) memcpy(msgbuf + sizeof(req), preset, preset_len);
@@ -389,6 +390,44 @@ static int send_ipc_init(AVCodecContext *avctx, int fd, uint32_t codec_id,
     if (type != IPC_MSG_INIT_OK) {
         snprintf(out_errbuf, out_errbuf_len, "unexpected INIT reply type %u", type);
         return AVERROR_EXTERNAL;
+    }
+
+    /* Real encoder extradata (SPS/PPS/VPS), see ipc_init_ok in
+     * ipc_protocol.h. Required whenever global_header was requested
+     * above: any muxer opened with "-flags +global_header" (every real
+     * Plex segment-muxer session) reads the codec's extradata while
+     * writing its own header/CodecPrivate immediately after this
+     * .init() callback returns, and dereferences it unconditionally --
+     * confirmed via a live crash (SIGSEGV, faulting address 0x10, PC
+     * inside libavformat.so.60's segment/mkv header-writing code,
+     * immediately after a real GPU init succeeded) against a build
+     * that left avctx->extradata unset. Not fatal if this payload is
+     * short/malformed -- fall through with no extradata rather than
+     * failing an otherwise-successful GPU/CPU init, same as the
+     * pre-existing behavior this replaces. */
+    if (plen >= sizeof(struct ipc_init_ok)) {
+        uint8_t *ok_buf = av_malloc(plen);
+        if (!ok_buf) {
+            snprintf(out_errbuf, out_errbuf_len, "INIT_OK payload alloc failed");
+            return AVERROR(ENOMEM);
+        }
+        if (ipc_recv_payload(fd, ok_buf, plen) < 0) {
+            av_freep(&ok_buf);
+            snprintf(out_errbuf, out_errbuf_len, "INIT_OK payload read failed");
+            return AVERROR(EIO);
+        }
+        struct ipc_init_ok ok;
+        memcpy(&ok, ok_buf, sizeof(ok));
+        if (ok.extradata_size > 0 && plen >= sizeof(ok) + ok.extradata_size) {
+            av_freep(&avctx->extradata);
+            avctx->extradata = av_malloc(ok.extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+            if (avctx->extradata) {
+                memcpy(avctx->extradata, ok_buf + sizeof(ok), ok.extradata_size);
+                memset(avctx->extradata + ok.extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+                avctx->extradata_size = (int)ok.extradata_size;
+            }
+        }
+        av_freep(&ok_buf);
     }
     return 0;
 }
@@ -1080,10 +1119,48 @@ static const FFCodec ff_hevc_nvdec_alias_decoder = {
  * handler itself calls fopen/fprintf (not strictly async-signal-safe),
  * acceptable for a diagnostic-only crash handler where the alternative
  * is zero information. */
-static void glue_crash_handler(int sig, siginfo_t *si, void *ucontext) {
-    (void)ucontext;
-    glue_log("CRASH: signal %d (%s) in Plex Transcoder process, faulting address %p",
-             sig, strsignal(sig), si ? si->si_addr : NULL);
+/* TEMPORARY diagnostic-only widening of the crash handler (2026-07-17
+ * struct-layout investigation): dumps the faulting PC plus which
+ * module/offset it falls in (via dladdr), so a crash inside the host
+ * Transcoder's own generic FFmpeg code (vs. inside this .so) can be
+ * pinpointed by disassembling the exact host binary at that offset,
+ * instead of guessing blind. ucontext_t's mcontext layout here is
+ * Linux aarch64-specific (struct sigcontext: fault_address, regs[31],
+ * sp, pc, pstate -- see asm/sigcontext.h); harmless no-op read on any
+ * other arch since this file only ever builds for aarch64 (see
+ * build-plugin.sh). */
+#include <ucontext.h>
+static void glue_crash_handler(int sig, siginfo_t *si, void *ucontext_v) {
+    void *pc = NULL;
+    ucontext_t *uc = (ucontext_t *)ucontext_v;
+    if (uc) pc = (void *)uc->uc_mcontext.pc;
+
+    Dl_info info = {0};
+    if (pc && dladdr(pc, &info)) {
+        glue_log("CRASH: signal %d (%s) in Plex Transcoder process, faulting address %p, "
+                 "pc %p (module %s, base %p, offset 0x%lx, nearest symbol %s+0x%lx)",
+                 sig, strsignal(sig), si ? si->si_addr : NULL, pc,
+                 info.dli_fname ? info.dli_fname : "?", info.dli_fbase,
+                 info.dli_fbase ? (unsigned long)((uintptr_t)pc - (uintptr_t)info.dli_fbase) : 0UL,
+                 info.dli_sname ? info.dli_sname : "?",
+                 info.dli_saddr ? (unsigned long)((uintptr_t)pc - (uintptr_t)info.dli_saddr) : 0UL);
+    } else {
+        glue_log("CRASH: signal %d (%s) in Plex Transcoder process, faulting address %p, pc %p (dladdr failed)",
+                 sig, strsignal(sig), si ? si->si_addr : NULL, pc);
+    }
+    if (uc) {
+        for (int r = 0; r < 31; r += 4) {
+            glue_log("  x%d=0x%llx x%d=0x%llx x%d=0x%llx x%d=0x%llx",
+                     r, (unsigned long long)uc->uc_mcontext.regs[r],
+                     r+1, (unsigned long long)(r+1 < 31 ? uc->uc_mcontext.regs[r+1] : 0),
+                     r+2, (unsigned long long)(r+2 < 31 ? uc->uc_mcontext.regs[r+2] : 0),
+                     r+3, (unsigned long long)(r+3 < 31 ? uc->uc_mcontext.regs[r+3] : 0));
+        }
+        glue_log("  sp=0x%llx pc=0x%llx pstate=0x%llx",
+                 (unsigned long long)uc->uc_mcontext.sp,
+                 (unsigned long long)uc->uc_mcontext.pc,
+                 (unsigned long long)uc->uc_mcontext.pstate);
+    }
     struct sigaction sa = {0};
     sa.sa_handler = SIG_DFL;
     sigaction(sig, &sa, NULL);

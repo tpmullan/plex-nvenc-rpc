@@ -29,7 +29,7 @@ enum {
     IPC_MSG_SHUTDOWN    = 4, /* no payload */
 
     /* nvenc-helper -> glue.c (encode direction) */
-    IPC_MSG_INIT_OK     = 5,  /* no payload */
+    IPC_MSG_INIT_OK     = 5,  /* struct ipc_init_ok + extradata bytes */
     IPC_MSG_INIT_ERR    = 6,  /* payload: NUL-terminated error string */
     IPC_MSG_PACKET      = 7,  /* struct ipc_packet_hdr + encoded bytes */
     IPC_MSG_FRAME_DONE  = 8,  /* no payload -- all packets for this FRAME/FLUSH sent */
@@ -72,6 +72,19 @@ struct ipc_init_req {
     float    crf;
     uint32_t preset_len;
     uint32_t x264opts_len;
+    /* Whether the host AVCodecContext was opened with
+     * AV_CODEC_FLAG_GLOBAL_HEADER (Plex passes "-flags +global_header"
+     * on every real segment-muxer session). Sent as our own explicit
+     * bit rather than forwarding the host's raw AVCodecContext.flags
+     * value, since that bitmask's layout is defined by whichever
+     * FFmpeg headers each side happens to be built against -- glue.c
+     * (musl, Plex's patched build) and nvenc-helper (glibc, a plain
+     * upstream FFmpeg checkout) are not guaranteed to agree on where
+     * that bit lives, only on what it means. When set, the helper's
+     * own internal encoder must be opened with the equivalent flag so
+     * it actually produces extradata (SPS/PPS/VPS) for
+     * IPC_MSG_INIT_OK to hand back -- see ipc_init_ok. */
+    uint32_t global_header;
 };
 
 /* Followed by width*height + 2*(width/2 * height/2) bytes of planar
@@ -79,6 +92,27 @@ struct ipc_init_req {
  * glue.c must pack from the host AVFrame's strided planes). */
 struct ipc_frame_hdr {
     int64_t pts;
+};
+
+/* Followed by `extradata_size` bytes of the helper's real encoder's
+ * out-of-band SPS/PPS/VPS parameter sets (AVCodecContext.extradata
+ * after avcodec_open2(), populated by the real encoder itself only
+ * when opened with the global-header flag -- see ipc_init_req's
+ * global_header field). glue.c must copy these into the HOST
+ * AVCodecContext's own extradata/extradata_size before returning from
+ * its .init() callback: any muxer run with "-flags +global_header"
+ * (every real Plex segment-muxer session) reads the codec's extradata
+ * while writing its own header/CodecPrivate immediately after open,
+ * and dereferences it unconditionally when the encoder declares
+ * AV_CODEC_CAP_* as a real, non-passthrough encoder -- confirmed via
+ * a live crash (SIGSEGV, faulting address 0x10, PC inside
+ * libavformat.so.60's segment/mkv header-writing code, immediately
+ * after a real GPU init succeeded) against a build that never set
+ * this. extradata_size == 0 is valid (e.g. HEVC/H264 profiles or
+ * encoder configs that inline parameter sets per-keyframe instead) --
+ * glue.c must not treat that as an error. */
+struct ipc_init_ok {
+    uint32_t extradata_size;
 };
 
 /* Followed by `size` bytes of encoded packet data. */

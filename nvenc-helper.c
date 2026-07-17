@@ -121,6 +121,15 @@ static int handle_init(int fd, const uint8_t *payload, uint32_t payload_len) {
     g_ctx->framerate = (AVRational){ (int)req.framerate_num, (int)req.framerate_den };
     if (req.rc_max_rate > 0) g_ctx->rc_max_rate = req.rc_max_rate;
     if (req.rc_buffer_size > 0) g_ctx->rc_buffer_size = (int)req.rc_buffer_size;
+    /* Must match the host's own AV_CODEC_FLAG_GLOBAL_HEADER so this
+     * real encoder actually produces extradata (SPS/PPS/VPS) for
+     * IPC_MSG_INIT_OK to hand back -- see ipc_protocol.h. Without this,
+     * a global-header session gets no parameter sets from the real
+     * encoder at all (it inlines them per-keyframe instead), so there
+     * would be nothing correct to forward even after fixing the
+     * IPC/glue.c side. */
+    if (req.global_header)
+        g_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
     /* codec_id 2 (CPU x264 fallback): apply the real quality settings
      * Plex actually requested, using the bundled real libx264 encoder
@@ -180,8 +189,21 @@ static int handle_init(int fd, const uint8_t *payload, uint32_t payload_len) {
 
     g_pkt = av_packet_alloc();
 
-    ipc_send_msg(fd, IPC_MSG_INIT_OK, NULL, 0);
-    fprintf(stderr, "nvenc-helper: initialized %s %ux%u\n", codec_name, req.width, req.height);
+    /* Hand the real encoder's own extradata (SPS/PPS/VPS, populated by
+     * avcodec_open2() above when global_header was requested) back to
+     * glue.c so it can set it on the HOST AVCodecContext -- see
+     * ipc_init_ok in ipc_protocol.h for why this is required. */
+    uint32_t extradata_size = g_ctx->extradata_size > 0 ? (uint32_t)g_ctx->extradata_size : 0;
+    size_t ok_len = sizeof(struct ipc_init_ok) + extradata_size;
+    uint8_t *ok_buf = malloc(ok_len);
+    struct ipc_init_ok ok = { .extradata_size = extradata_size };
+    memcpy(ok_buf, &ok, sizeof(ok));
+    if (extradata_size)
+        memcpy(ok_buf + sizeof(ok), g_ctx->extradata, extradata_size);
+    ipc_send_msg(fd, IPC_MSG_INIT_OK, ok_buf, (uint32_t)ok_len);
+    free(ok_buf);
+    fprintf(stderr, "nvenc-helper: initialized %s %ux%u (extradata %u bytes)\n",
+            codec_name, req.width, req.height, extradata_size);
     return 0;
 }
 
